@@ -1,0 +1,140 @@
+-- Task4
+
+-- 4.2.1
+DELIMITER $$
+
+CREATE TRIGGER trg_return_accept_refund
+AFTER UPDATE ON ReturnedItem
+FOR EACH ROW
+BEGIN
+  DECLARE v_max       DECIMAL(10,2);
+  DECLARE v_refunded  DECIMAL(10,2);
+  DECLARE v_to_refund DECIMAL(10,2);
+  DECLARE v_dummy_id  BIGINT;
+
+  -- Trigger fires only when the returnStatus changes to 'Accepted'
+  IF NEW.returnStatus = 'Accepted'
+     AND (OLD.returnStatus IS NULL OR OLD.returnStatus <> 'Accepted') THEN
+
+    -- Find the maximum refundable amount
+    SELECT (oi.quantity * oi.priceAtPurchase)
+      INTO v_max
+      FROM OrderItem oi
+      WHERE oi.orderItemID = NEW.orderItemID
+      FOR UPDATE;
+
+    -- If the related OrderItem cannot be found, raise an error.
+    IF v_max IS NULL THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Order item not found for the return';
+    END IF;
+
+    -- prevents multiple users from creating refunds at the same time.
+    SELECT r.refundID
+      INTO v_dummy_id
+      FROM Refund r
+      JOIN ReturnedItem ri ON ri.returnID = r.returnID
+      WHERE ri.orderItemID = NEW.orderItemID
+      ORDER BY r.refundID DESC
+      LIMIT 1
+      FOR UPDATE;
+
+    -- Calculate the total amount already refunded
+    SELECT COALESCE(SUM(r.refundAmount),0)
+      INTO v_refunded
+      FROM Refund r
+      JOIN ReturnedItem ri ON ri.returnID = r.returnID
+      WHERE ri.orderItemID = NEW.orderItemID;
+
+    -- Determine how much to refund this time.
+    SET v_to_refund = COALESCE(NEW.refundAmount, v_max - v_refunded);
+
+    -- Prevent refunding 0 or negative amounts.
+    IF v_to_refund IS NULL OR v_to_refund <= 0 THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'No refundable amount remains';
+    END IF;
+
+    -- Prevent that total refund amount not over original purchase price.
+    IF (v_refunded + v_to_refund) > v_max THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Refund exceeds original purchase price';
+    END IF;
+
+    -- Insert a new refund record automatically.
+    INSERT INTO Refund (returnID, refundMethod, refundAmount, processedAt)
+    VALUES (NEW.returnID, 'Auto', ROUND(v_to_refund, 2), NOW());
+  END IF;
+END $$
+DELIMITER ;
+
+
+show triggers;
+
+-- 4.2.2
+
+DROP TRIGGER IF EXISTS trg_cusorder_points;
+DELIMITER $$
+
+CREATE TRIGGER trg_cusorder_points
+AFTER UPDATE ON CusOrder
+FOR EACH ROW
+BEGIN
+  DECLARE v_earned INT DEFAULT 0;
+  DECLARE v_spent  INT DEFAULT 0;
+  DECLARE v_net    INT DEFAULT 0;
+  DECLARE v_points INT DEFAULT 0;
+  DECLARE v_lock_user BIGINT; 
+
+  SET v_points = FLOOR(ROUND(NEW.totalAmount, 2) * 0.05);
+
+  -- Check existing loyalty transactions
+  SELECT COALESCE(SUM(pointsEarned),0), COALESCE(SUM(pointsSpent),0)
+    INTO v_earned, v_spent
+    FROM LoyaltyTransaction
+    WHERE orderID = NEW.orderID;
+
+-- total points for this order
+  SET v_net = v_earned - v_spent;
+
+  -- Customer earns points for the first time when Order changes to 'Delivered'
+  IF NEW.orderStatus = 'Delivered'
+     AND (OLD.orderStatus IS NULL OR OLD.orderStatus <> 'Delivered') THEN
+
+    -- Only award points if they haven't already been granted
+    IF v_net = 0 AND v_points > 0 THEN
+      SELECT userID INTO v_lock_user FROM `User` WHERE userID = NEW.userID FOR UPDATE;
+
+      -- Insert a loyalty transaction for earned points
+      INSERT INTO LoyaltyTransaction (userID, orderID, pointsEarned, pointsSpent, transactionDate)
+      VALUES (NEW.userID, NEW.orderID, v_points, 0, NOW());
+
+      -- Increase user's total loyalty points
+      UPDATE `User`
+         SET loyaltyPoints = loyaltyPoints + v_points
+       WHERE userID = NEW.userID;
+    END IF;
+  END IF;
+
+  -- If order status changed, changes to previously awarded points
+  IF NEW.orderStatus IN ('Cancelled','Returned')
+     AND (OLD.orderStatus IS NULL OR OLD.orderStatus NOT IN ('Cancelled','Returned')) THEN
+
+    IF v_net > 0 THEN
+      SELECT userID INTO v_lock_user FROM `User` WHERE userID = NEW.userID FOR UPDATE;
+
+      -- Record a loyalty transaction for point deduction
+      INSERT INTO LoyaltyTransaction (userID, orderID, pointsEarned, pointsSpent, transactionDate)
+      VALUES (NEW.userID, NEW.orderID, 0, v_net, NOW());
+
+      -- Deduct points (prevent negative total)
+      UPDATE `User`
+         SET loyaltyPoints = GREATEST(loyaltyPoints - v_net, 0)
+       WHERE userID = NEW.userID;
+    END IF;
+  END IF;
+END $$
+DELIMITER ;
+
+
+show triggers;
