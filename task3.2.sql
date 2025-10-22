@@ -160,7 +160,7 @@ BEGIN
         FROM Payment
         WHERE orderID = p_OrderID AND paymentStatus='Approved';
 
-        IF ABS(vPaid - vOrderTotal) > 0.02 THEN
+        IF vPaid - vOrderTotal THEN
             SET o_Status='FAILURE',
                 o_Message=CONCAT('Payment mismatch: paid=', vPaid, ' vs due=', vOrderTotal);
             SET vErr = 1;
