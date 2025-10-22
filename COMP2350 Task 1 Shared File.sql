@@ -299,3 +299,156 @@ VALUES
 (1, 'Credit Card', 129.00, '2025-07-26 11:55:00'),
 (3, 'Afterpay', 349.90, '2025-09-08 09:30:00'),  
 (4, 'Afterpay', 49.90, '2025-09-09 12:30:00');  
+
+-- Task4
+
+-- 4.2.1
+
+DELIMITER $$
+
+CREATE TRIGGER trg_return_accept_refund
+AFTER UPDATE ON ReturnedItem
+FOR EACH ROW
+BEGIN
+  DECLARE v_max       DECIMAL(10,2);  
+  DECLARE v_refunded  DECIMAL(10,2);
+  DECLARE v_to_refund DECIMAL(10,2); 
+
+  IF NEW.returnStatus = 'Accepted'
+     AND (OLD.returnStatus IS NULL OR OLD.returnStatus <> 'Accepted') THEN
+
+    SELECT (oi.quantity * oi.priceAtPurchase)
+      INTO v_max
+      FROM OrderItem oi
+      WHERE oi.orderItemID = NEW.orderItemID;
+
+    IF v_max IS NULL THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Order item not found for the return';
+    END IF;
+
+    SELECT COALESCE(SUM(r.refundAmount), 0)
+      INTO v_refunded
+      FROM Refund r
+      JOIN ReturnedItem ri ON ri.returnID = r.returnID
+      WHERE ri.orderItemID = NEW.orderItemID;
+
+    SET v_to_refund = COALESCE(NEW.refundAmount, v_max - v_refunded);
+
+
+    IF v_to_refund IS NULL OR v_to_refund <= 0 THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'No refundable amount remains';
+    END IF;
+
+    IF (v_refunded + v_to_refund) > v_max THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Refund exceeds original purchase price';
+    END IF;
+
+    INSERT INTO Refund (returnID, refundMethod, refundAmount, processedAt)
+    VALUES (NEW.returnID, 'Auto', ROUND(v_to_refund, 2), NOW());
+  END IF;
+END $$
+DELIMITER ;
+
+SHOW TRIGGERS;
+
+-- 4.2.2
+
+DELIMITER $$
+
+CREATE TRIGGER trg_cusorder_points
+AFTER UPDATE ON CusOrder
+FOR EACH ROW
+BEGIN
+  DECLARE v_earned INT DEFAULT 0;  
+  DECLARE v_spent  INT DEFAULT 0; 
+  DECLARE v_net    INT DEFAULT 0; 
+  DECLARE v_points INT DEFAULT 0; 
+
+  SET v_points = FLOOR(ROUND(NEW.totalAmount, 2) * 0.05);
+
+  SELECT COALESCE(SUM(pointsEarned),0), COALESCE(SUM(pointsSpent),0)
+    INTO v_earned, v_spent
+    FROM LoyaltyTransaction
+    WHERE orderID = NEW.orderID;
+
+  SET v_net = v_earned - v_spent;
+
+  IF NEW.orderStatus = 'Delivered'
+     AND (OLD.orderStatus IS NULL OR OLD.orderStatus <> 'Delivered') THEN
+    IF v_net = 0 AND v_points > 0 THEN
+      INSERT INTO LoyaltyTransaction (userID, orderID, pointsEarned, pointsSpent, transactionDate)
+      VALUES (NEW.userID, NEW.orderID, v_points, 0, NOW());
+
+      UPDATE `User`
+         SET loyaltyPoints = loyaltyPoints + v_points
+       WHERE userID = NEW.userID;
+    END IF;
+  END IF;
+
+  IF NEW.orderStatus IN ('Cancelled','Returned')
+     AND (OLD.orderStatus IS NULL OR OLD.orderStatus NOT IN ('Cancelled','Returned')) THEN
+    IF v_net > 0 THEN
+      INSERT INTO LoyaltyTransaction (userID, orderID, pointsEarned, pointsSpent, transactionDate)
+      VALUES (NEW.userID, NEW.orderID, 0, v_net, NOW());
+
+      UPDATE `User`
+         SET loyaltyPoints = GREATEST(loyaltyPoints - v_net, 0)
+       WHERE userID = NEW.userID;
+    END IF;
+  END IF;
+END $$
+DELIMITER ;
+
+SHOW TRIGGERS;
+
+
+
+-- 4.3 TESTS
+
+-- 4.3.1
+
+-- Test 1 - Return is accepted
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (1, 50.00, 'Delivered');
+INSERT INTO OrderItem (orderID, productID, quantity, priceAtPurchase) VALUES (LAST_INSERT_ID(), 4, 1, 50.00);
+INSERT INTO ReturnedItem (orderItemID, returnStatus) VALUES (LAST_INSERT_ID(), 'Pending');
+SET @test1_returnID = LAST_INSERT_ID();
+UPDATE ReturnedItem SET returnStatus = 'Accepted' WHERE returnID = @test1_returnID;
+SELECT * FROM Refund WHERE returnID = @test1_returnID;
+
+-- Test 2 - Return is rejected
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (3, 25.00, 'Delivered');
+INSERT INTO OrderItem (orderID, productID, quantity, priceAtPurchase) VALUES (LAST_INSERT_ID(), 5, 1, 25.00);
+INSERT INTO ReturnedItem (orderItemID, returnStatus) VALUES (LAST_INSERT_ID(), 'Pending');
+SET @test2_returnID = LAST_INSERT_ID();
+UPDATE ReturnedItem SET returnStatus = 'Declined' WHERE returnID = @test2_returnID;
+SELECT * FROM Refund WHERE returnID = @test2_returnID;
+
+-- Test 3 - Prevent returning too much
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (5, 80.00, 'Delivered');
+INSERT INTO OrderItem (orderID, productID, quantity, priceAtPurchase) VALUES (LAST_INSERT_ID(), 7, 1, 80.00);
+INSERT INTO ReturnedItem (orderItemID, returnStatus, refundAmount) VALUES (LAST_INSERT_ID(), 'Pending', 99.00);
+SET @test3_returnID = LAST_INSERT_ID();
+UPDATE ReturnedItem SET returnStatus = 'Accepted' WHERE returnID = @test3_returnID;
+
+-- 4.3.2
+
+-- Test 1 - Order is delivered, Giving points
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (12, 100.00, 'Processing');
+SET @test4_orderID = LAST_INSERT_ID();
+UPDATE CusOrder SET orderStatus = 'Delivered' WHERE orderID = @test4_orderID;
+SELECT loyaltyPoints FROM User WHERE userID = 12;
+
+-- Test 2 - Delivery is cancelled, Taking points
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (14, 200.00, 'Delivered');
+SET @test5_orderID = LAST_INSERT_ID();
+UPDATE CusOrder SET orderStatus = 'Cancelled' WHERE orderID = @test5_orderID;
+SELECT loyaltyPoints FROM User WHERE userID = 14;
+
+-- Test 3 - Order change from Processing to Cancelled, No points
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (16, 300.00, 'Processing');
+SET @test6_orderID = LAST_INSERT_ID();
+UPDATE CusOrder SET orderStatus = 'Cancelled' WHERE orderID = @test6_orderID;
+SELECT loyaltyPoints FROM User WHERE userID = 16;
