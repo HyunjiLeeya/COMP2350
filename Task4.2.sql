@@ -471,4 +471,50 @@ SHOW TRIGGERS;
 
 
 
+-- 4.3 TESTS
+
+-- 4.3.1
+
+-- Test 1 - Return is accepted
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (1, 50.00, 'Delivered');
+INSERT INTO OrderItem (orderID, productID, quantity, priceAtPurchase) VALUES (LAST_INSERT_ID(), 4, 1, 50.00);
+INSERT INTO ReturnedItem (orderItemID, returnStatus) VALUES (LAST_INSERT_ID(), 'Pending');
+SET @test1_returnID = LAST_INSERT_ID();
+UPDATE ReturnedItem SET returnStatus = 'Accepted' WHERE returnID = @test1_returnID;
+SELECT * FROM Refund WHERE returnID = @test1_returnID;
+
+-- Test 2 - Return is rejected
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (3, 25.00, 'Delivered');
+INSERT INTO OrderItem (orderID, productID, quantity, priceAtPurchase) VALUES (LAST_INSERT_ID(), 5, 1, 25.00);
+INSERT INTO ReturnedItem (orderItemID, returnStatus) VALUES (LAST_INSERT_ID(), 'Pending');
+SET @test2_returnID = LAST_INSERT_ID();
+UPDATE ReturnedItem SET returnStatus = 'Declined' WHERE returnID = @test2_returnID;
+SELECT * FROM Refund WHERE returnID = @test2_returnID;
+
+-- Test 3 - Prevent returning too much
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (5, 80.00, 'Delivered');
+INSERT INTO OrderItem (orderID, productID, quantity, priceAtPurchase) VALUES (LAST_INSERT_ID(), 7, 1, 80.00);
+INSERT INTO ReturnedItem (orderItemID, returnStatus, refundAmount) VALUES (LAST_INSERT_ID(), 'Pending', 99.00);
+SET @test3_returnID = LAST_INSERT_ID();
+UPDATE ReturnedItem SET returnStatus = 'Accepted' WHERE returnID = @test3_returnID;
+
+-- 4.3.2
+
+-- Test 1 - Order is delivered, Giving points
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (12, 100.00, 'Processing');
+SET @test4_orderID = LAST_INSERT_ID();
+UPDATE CusOrder SET orderStatus = 'Delivered' WHERE orderID = @test4_orderID;
+SELECT loyaltyPoints FROM User WHERE userID = 12;
+
+-- Test 2 - Delivery is cancelled, Taking points
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (14, 200.00, 'Delivered');
+SET @test5_orderID = LAST_INSERT_ID();
+UPDATE CusOrder SET orderStatus = 'Cancelled' WHERE orderID = @test5_orderID;
+SELECT loyaltyPoints FROM User WHERE userID = 14;
+
+-- Test 3 - Order change from Processing to Cancelled, No points
+INSERT INTO CusOrder (userID, totalAmount, orderStatus) VALUES (16, 300.00, 'Processing');
+SET @test6_orderID = LAST_INSERT_ID();
+UPDATE CusOrder SET orderStatus = 'Cancelled' WHERE orderID = @test6_orderID;
+SELECT loyaltyPoints FROM User WHERE userID = 16;
 
